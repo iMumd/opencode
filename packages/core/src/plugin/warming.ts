@@ -5,7 +5,7 @@ import type { SessionHooks } from "@opencode/plugin/effect/session"
 import type { Provider } from "@opencode/schema/provider"
 import type { Session } from "@opencode/schema/session"
 import { ConfigWarming } from "@opencode/schema/config/warming"
-import { Clock, Duration, Effect, Option, Schema, Scope, Stream } from "effect"
+import { Clock, Data, Duration, Effect, Option, Schema, Scope, Stream } from "effect"
 import { Config } from "../config.js"
 import { resolveModel } from "./optimize.js"
 
@@ -16,6 +16,14 @@ const defaults = {
   interval: Duration.minutes(4),
   duration: Duration.minutes(30),
 }
+
+/** Whether a session's warming is sending pings. */
+type Status = Data.TaggedEnum<{
+  Active: {}
+  /** A ping missed the cache, so pinging waits for the session's next non-warming request. */
+  StoppedAfterMiss: {}
+}>
+const Status = Data.taggedEnum<Status>()
 
 export const Plugin = define({
   id: "opencode.warming",
@@ -54,7 +62,7 @@ export const Plugin = define({
     })
 
     const scope = yield* Scope.Scope
-    const sessions = new Map<Session.ID, { last: number; expires: number; settings: typeof defaults }>()
+    const sessions = new Map<Session.ID, { last: number; expires: number; settings: typeof defaults; status: Status }>()
     // A ping during a model request would compete with the request it keeps warm, which stalls single-slot local models.
     // A request counts from its context hook, because `session.step.started` waits for the first response chunk.
     const requesting = new Set<Session.ID>()
@@ -80,36 +88,50 @@ export const Plugin = define({
         ),
         Effect.forkScoped({ startImmediately: true }),
       )
-    const loop: (sessionID: Session.ID) => Effect.Effect<void> = Effect.fn("WarmingPlugin.loop")(
-      function* (sessionID) {
-        const current = sessions.get(sessionID)
-        if (!current) return
+    const loop: (sessionID: Session.ID) => Effect.Effect<void> = Effect.fn("WarmingPlugin.loop")(function* (sessionID) {
+      const current = sessions.get(sessionID)
+      if (!current) return
 
-        const now = yield* Clock.currentTimeMillis
-        const next = Math.min(current.last + Duration.toMillis(current.settings.interval), current.expires)
-        if (now < next) {
-          yield* Effect.sleep(Duration.millis(next - now))
-          return yield* loop(sessionID)
-        }
-        if (now >= current.expires) {
-          sessions.delete(sessionID)
-          return
-        }
-        if (requesting.has(sessionID)) {
-          yield* Effect.sleep(current.settings.interval)
-          return yield* loop(sessionID)
-        }
-
-        const last = current.last
-        yield* Effect.logInfo("warming session", { sessionID, last })
-        yield* ctx.session
-          .generate({ sessionID, prompt: current.settings.prompt })
-          .pipe(Effect.catchCause((cause) => Effect.logWarning("failed to warm session", { sessionID, cause })))
-        const latest = sessions.get(sessionID)
-        if (latest === current && latest.last === last) latest.last = yield* Clock.currentTimeMillis
+      const now = yield* Clock.currentTimeMillis
+      const next = Math.min(current.last + Duration.toMillis(current.settings.interval), current.expires)
+      if (now < next) {
+        yield* Effect.sleep(Duration.millis(next - now))
         return yield* loop(sessionID)
-      },
-    )
+      }
+      if (now >= current.expires) {
+        sessions.delete(sessionID)
+        return
+      }
+      if (requesting.has(sessionID)) {
+        yield* Effect.sleep(current.settings.interval)
+        return yield* loop(sessionID)
+      }
+
+      const last = current.last
+      yield* Effect.logInfo("warming session", { sessionID, last })
+      const result = yield* ctx.session
+        .generate({ sessionID, prompt: current.settings.prompt })
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("failed to warm session", { sessionID, cause }).pipe(Effect.as(undefined)),
+          ),
+        )
+      const latest = sessions.get(sessionID)
+      if (latest !== current || latest.last !== last) return yield* loop(sessionID)
+      // A ping that wrote more to the cache than it read rebuilt the cache instead of keeping it, so later pings
+      // would keep paying for that. Providers that report no cache usage never count as a miss.
+      if (result && result.tokens.cache.read < result.tokens.cache.write) {
+        latest.status = Status.StoppedAfterMiss()
+        yield* Effect.logInfo("stopped warming session after a cache miss", {
+          sessionID,
+          read: result.tokens.cache.read,
+          write: result.tokens.cache.write,
+        })
+        return
+      }
+      latest.last = yield* Clock.currentTimeMillis
+      return yield* loop(sessionID)
+    })
 
     const hook = (event: SessionHooks["context"]) =>
       Effect.gen(function* () {
@@ -137,14 +159,15 @@ export const Plugin = define({
 
         const now = yield* Clock.currentTimeMillis
         const duration = Duration.toMillis(settings.duration)
-        if (active) {
+        if (active?.status._tag === "Active") {
           active.last = now
           active.expires = now + duration
           active.settings = settings
           return
         }
-        sessions.set(event.sessionID, { last: now, expires: now + duration, settings })
-        yield* Effect.logInfo("scheduled session warming", {
+        // A session stopped after a miss has no running loop, so its next real request starts one.
+        sessions.set(event.sessionID, { last: now, expires: now + duration, settings, status: Status.Active() })
+        yield* Effect.logInfo(active ? "resumed session warming" : "scheduled session warming", {
           sessionID: event.sessionID,
           interval: settings.interval,
           expires: now + duration,
